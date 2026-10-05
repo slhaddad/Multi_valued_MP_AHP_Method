@@ -1,4 +1,12 @@
 ﻿// corrigé le 25/06/2020
+// Version V3 : élément structurant (ES) = disque euclidien de rayon i (dx² + dy² <= i²),
+//   utilisé directement en une seule passe pour l'érosion, la dilatation, l'ouverture et
+//   la fermeture (5, 13, 29, 49, 81 pixels pour i = 1..5, comme skimage.morphology.disk(i)).
+//   La reconstruction géodésique utilise le disque élémentaire B1 (rayon 1, 5 pixels).
+// Version V4 : [V4-ANTI-CONDORCET] le ∧ / ∨ point à point de la reconstruction utilise un ordre de référence
+//   fixe et transitif (score de la méthode contre un panel fixe de vecteurs de l'image), et la suite
+//   des marqueurs est rendue monotone : plus de cycle de Condorcet, stabilité toujours atteinte.
+//   Le classement des n pixels de la fenêtre (MinMaxVecteurs) est inchangé.
 using Microsoft.Win32;
 using System;
 using System.Collections.Generic;
@@ -293,6 +301,161 @@ namespace EMP_AHP_UniquePreferenceFunction
             return false;
         }
 
+        // =====================================================================================
+        // [V4-ANTI-CONDORCET] ORDRE DE RÉFÉRENCE FIXE POUR LE ∧ / ∨ POINT À POINT DE LA RECONSTRUCTION
+        // =====================================================================================
+        // Méthode : AHP.
+        // Problème corrigé : jusqu'ici, le ∧ / ∨ point à point de la reconstruction comparait deux vecteurs
+        // seuls (la méthode appliquée à l'ensemble {A, B}). Cette comparaison n'est pas transitive : elle
+        // admet des cycles de Condorcet (A > B, B > C et C > A), et la reconstruction pouvait tourner en
+        // boucle sans jamais se stabiliser.
+        // Correction : chaque vecteur v reçoit un score FIXE, calculé avec la même méthode et les mêmes
+        // paramètres, mais toujours contre le même panel de référence R : au plus TAILLE_PANEL_REF
+        // vecteurs prélevés une fois pour toutes dans l'image d'entrée f.
+        //   S_R(v) = priorité globale AHP de v dans l'ensemble R ∪ {v} (mêmes matrices de préférence
+        //   1 + d / 1/(1 + |d|), même normalisation par colonne, mêmes poids que MinMaxVecteurs).
+        // Deux vecteurs sont comparés par ce score, puis par l'ordre lexicographique des bandes en cas
+        // d'égalité : c'est un ordre TOTAL sur les valeurs (réflexif, antisymétrique, transitif), donc
+        // aucun cycle de Condorcet n'est possible. Le classement des n pixels de la fenêtre
+        // (MinMaxVecteurs) n'est PAS modifié : seul le ∧ / ∨ point à point de la reconstruction change.
+        private const int TAILLE_PANEL_REF = 256;          // [V4-ANTI-CONDORCET] nombre maximal de vecteurs du panel R
+        private List<int[]> panelRef;                       // [V4-ANTI-CONDORCET] panel de référence R
+        private int[] prioriteRef;                          // [V4-ANTI-CONDORCET] ordre des bandes pour le départage
+        private Dictionary<int[], double> cacheScoreRef;    // [V4-ANTI-CONDORCET] score déjà calculé de chaque vecteur
+        private double[] poidsRef;                          // [V4-ANTI-CONDORCET] poids des bandes
+        private double[][] colRef;                          // [V4-ANTI-CONDORCET] sommes par colonne des préférences du panel
+        // [V4-ANTI-CONDORCET] Égalité exacte de deux vecteurs (clé du cache des scores)
+        private sealed class ComparateurVecteurs : IEqualityComparer<int[]>
+        {
+            public bool Equals(int[] a, int[] b)
+            {
+                if (ReferenceEquals(a, b)) return true;
+                if (a == null || b == null || a.Length != b.Length) return false;
+                for (int i = 0; i < a.Length; i++)
+                    if (a[i] != b[i]) return false;
+                return true;
+            }
+
+            public int GetHashCode(int[] a)
+            {
+                unchecked
+                {
+                    int h = 17;
+                    for (int i = 0; i < a.Length; i++) h = h * 31 + a[i];
+                    return h;
+                }
+            }
+        }
+
+        // [V4-ANTI-CONDORCET] Construction du panel R (prélèvement systématique : un pixel sur 'pas', dans
+        // l'ordre de parcours x puis y de l'image d'entrée) et de l'ordre de départage des bandes.
+        private void PreparerOrdreReference(List<int[,]> imagesMat, double[] poids)
+        {
+            int m = imagesMat.Count;
+            int W = imagesMat[0].GetLength(0), H = imagesMat[0].GetLength(1);
+            int total = W * H;
+            int pas = Math.Max(1, (total + TAILLE_PANEL_REF - 1) / TAILLE_PANEL_REF);
+            panelRef = new List<int[]>();
+            for (int p = 0; p < total; p += pas)
+            {
+                int[] v = new int[m];
+                for (int k = 0; k < m; k++) v[k] = imagesMat[k][p / H, p % H];
+                panelRef.Add(v);
+            }
+            // Départage : bandes par poids décroissant (à poids égaux, la bande d'indice le plus petit d'abord)
+            prioriteRef = new int[m];
+            for (int k = 0; k < m; k++) prioriteRef[k] = k;
+            for (int a = 1; a < m; a++)   // tri par insertion (stable)
+            {
+                int bande = prioriteRef[a];
+                int j = a - 1;
+                while (j >= 0 && poids[prioriteRef[j]] < poids[bande])
+                {
+                    prioriteRef[j + 1] = prioriteRef[j];
+                    j--;
+                }
+                prioriteRef[j + 1] = bande;
+            }
+            poidsRef = (double[])poids.Clone();
+            // Sommes par colonne des matrices de préférence AHP restreintes au panel :
+            // colRef[k][j] = somme_{l dans R} P_k(r_l, r_j)
+            int nR = panelRef.Count;
+            colRef = new double[m][];
+            for (int k = 0; k < m; k++)
+            {
+                colRef[k] = new double[nR];
+                for (int j = 0; j < nR; j++)
+                {
+                    double somme = 0;
+                    for (int l = 0; l < nR; l++) somme += PreferenceAHP(panelRef[l][k], panelRef[j][k]);
+                    colRef[k][j] = somme;
+                }
+            }
+            cacheScoreRef = new Dictionary<int[], double>(new ComparateurVecteurs());
+        }
+
+        // [V4-ANTI-CONDORCET] Préférence AHP de la valeur gi sur la valeur gj (même formule que MinMaxVecteurs)
+        private static double PreferenceAHP(int gi, int gj)
+        {
+            int diff = gi - gj;
+            return diff >= 0 ? 1 + diff : 1.0 / (1 - diff);
+        }
+
+        // [V4-ANTI-CONDORCET] Score fixe S_R(v) : priorité globale AHP de v dans l'ensemble R ∪ {v}
+        private double ScoreReference(int[] v)
+        {
+            double s;
+            if (cacheScoreRef.TryGetValue(v, out s)) return s;
+            int m = v.Length;
+            int nR = panelRef.Count;
+            double total = 0;
+            for (int k = 0; k < m; k++)
+            {
+                double ligne = 0;        // somme de la ligne de v dans la matrice normalisée par colonne
+                double colonneV = 1.0;   // somme de la colonne de v : P(v, v) = 1 + somme_j P(r_j, v)
+                for (int j = 0; j < nR; j++)
+                {
+                    double pvj = PreferenceAHP(v[k], panelRef[j][k]);
+                    ligne += pvj / (colRef[k][j] + pvj);                // colonne j = panel + ligne de v
+                    colonneV += PreferenceAHP(panelRef[j][k], v[k]);
+                }
+                ligne += 1.0 / colonneV;                                  // terme P(v, v) / somme de la colonne de v
+                total += poidsRef[k] * ligne / (nR + 1);                  // w_k * alpha_v^(k)
+            }
+            s = total;
+            if (double.IsNaN(s) || double.IsInfinity(s)) s = 0;   // sécurité : le score reste une fonction de v
+            s = Math.Round(s, 10);                                 // arrondi fixe : ex aequo numériques => départage lexicographique
+            cacheScoreRef[v] = s;
+            return s;
+        }
+
+        // [V4-ANTI-CONDORCET] Comparaison de deux vecteurs pour le ∧ / ∨ point à point de la reconstruction :
+        // score fixe (contre le panel R), puis ordre lexicographique des bandes (prioriteRef) en cas d'égalité.
+        // C'est un ordre total sur les valeurs : il est transitif, aucun cycle de Condorcet n'est possible.
+        // Retourne -1 si A < B, 0 si A et B sont le même vecteur, 1 si A > B.
+        private int CompareReference(List<int[,]> imgA, int xa, int ya, List<int[,]> imgB, int xb, int yb)
+        {
+            int m = imgA.Count;
+            int[] a = new int[m];
+            int[] b = new int[m];
+            for (int k = 0; k < m; k++)
+            {
+                a[k] = imgA[k][xa, ya];
+                b[k] = imgB[k][xb, yb];
+            }
+            double sa = ScoreReference(a);
+            double sb = ScoreReference(b);
+            if (sa < sb) return -1;
+            if (sa > sb) return 1;
+            foreach (int k in prioriteRef)
+            {
+                if (a[k] < b[k]) return -1;
+                if (a[k] > b[k]) return 1;
+            }
+            return 0;
+        }
+
+
         private void Reconstruction(List<int[,]> imagesMat, List<int[,]> imagesErodeInit, List<int[,]> imagesDilateInit, double[] poids, int itStabilite, double prStabilite, ref List<int[,]> gNewOuvert, ref List<int[,]> gNewFerme)
         {
             List<int[,]> gLastFerme = new List<int[,]>();
@@ -304,6 +467,21 @@ namespace EMP_AHP_UniquePreferenceFunction
                 gLastOuvert.Add((int[,])imagesErodeInit[k].Clone());
                 gLastFerme.Add((int[,])imagesDilateInit[k].Clone());
             }
+
+            // [V4-ANTI-CONDORCET] Ordre de référence fixe (transitif) utilisé par le ∧ / ∨ point à point.
+            PreparerOrdreReference(imagesMat, poids);
+            // [V4-ANTI-CONDORCET] Marqueurs placés du bon côté du masque f (au sens de l'ordre de référence) :
+            //   ouverture : h0 = inf(epsilon(f), f) ;  fermeture : h0 = sup(delta(f), f).
+            // Avec la règle de monotonie de ErosionDilatationGeodesique, la suite des marqueurs est monotone
+            // et bornée par f dans un ensemble fini de vecteurs : la stabilité est TOUJOURS atteinte.
+            for (int x = 0; x < imagesMat[0].GetLength(0); x++)
+                for (int y = 0; y < imagesMat[0].GetLength(1); y++)
+                {
+                    if (CompareReference(gLastOuvert, x, y, imagesMat, x, y) > 0)
+                        for (int k = 0; k < imagesMat.Count; k++) gLastOuvert[k][x, y] = imagesMat[k][x, y];
+                    if (CompareReference(gLastFerme, x, y, imagesMat, x, y) < 0)
+                        for (int k = 0; k < imagesMat.Count; k++) gLastFerme[k][x, y] = imagesMat[k][x, y];
+                }
             int toleranceStabilite = 0;
             if (itStabilite == 0) itStabilite = int.MaxValue;
             bool stopErod = false, stopDilat = false;
@@ -320,6 +498,8 @@ namespace EMP_AHP_UniquePreferenceFunction
             }
         }
 
+        // [V4-ANTI-CONDORCET] Le ∧ / ∨ point à point utilise CompareReference (ordre de référence fixe et transitif)
+        // et la suite des marqueurs est monotone (voir la section ORDRE DE RÉFÉRENCE FIXE).
         private void ErosionDilatationGeodesique(List<int[,]> imagesMat, List<int[,]> gLastFerme, List<int[,]> gLastOuvert, double[] poids, double prStabilite, ref List<int[,]> gNewFerme, ref List<int[,]> gNewOuvert, ref bool stopErod, ref bool stopDilat)
         {
             int W = imagesMat[0].GetLength(0), H = imagesMat[0].GetLength(1);
@@ -341,16 +521,28 @@ namespace EMP_AHP_UniquePreferenceFunction
                     {
                         int sMax = 0, tMax = 0, sMin = 0, tMin = 0;
                         MinMaxVecteurs(gLastFerme, gLastOuvert, poids, x, y, ref sMin, ref tMin, ref sMax, ref tMax, 1);
-                        int cmpFerme = CompareDeuxVecteursAHP(imagesMat, x, y, gLastFerme, sMin, tMin, poids);
+                        // [V4-ANTI-CONDORCET] sup(epsilon_B1(h), f) au sens de l'ordre de référence fixe (transitif)
+                        int cmpFerme = CompareReference(imagesMat, x, y, gLastFerme, sMin, tMin);
                         if (cmpFerme < 0)
                             for (int k = 0; k < imagesMat.Count; k++) gNewFerme[k][x, y] = gLastFerme[k][sMin, tMin];
                         else
                             for (int k = 0; k < imagesMat.Count; k++) gNewFerme[k][x, y] = imagesMat[k][x, y];
-                        int cmpOuvert = CompareDeuxVecteursAHP(gLastOuvert, sMax, tMax, imagesMat, x, y, poids);
+                        // [V4-ANTI-CONDORCET] Monotonie : la fermeture par reconstruction est la limite d'une suite
+                        // DÉCROISSANTE. Si la nouvelle valeur est plus grande que la précédente (au sens de l'ordre
+                        // de référence), la valeur précédente est conservée : aucun aller-retour, donc aucun cycle.
+                        if (CompareReference(gNewFerme, x, y, gLastFerme, x, y) > 0)
+                            for (int k = 0; k < imagesMat.Count; k++) gNewFerme[k][x, y] = gLastFerme[k][x, y];
+                        // [V4-ANTI-CONDORCET] inf(delta_B1(h), f) au sens de l'ordre de référence fixe (transitif)
+                        int cmpOuvert = CompareReference(gLastOuvert, sMax, tMax, imagesMat, x, y);
                         if (cmpOuvert < 0)
                             for (int k = 0; k < imagesMat.Count; k++) gNewOuvert[k][x, y] = gLastOuvert[k][sMax, tMax];
                         else
                             for (int k = 0; k < imagesMat.Count; k++) gNewOuvert[k][x, y] = imagesMat[k][x, y];
+                        // [V4-ANTI-CONDORCET] Monotonie : l'ouverture par reconstruction est la limite d'une suite
+                        // CROISSANTE. Si la nouvelle valeur est plus petite que la précédente (au sens de l'ordre
+                        // de référence), la valeur précédente est conservée : aucun aller-retour, donc aucun cycle.
+                        if (CompareReference(gNewOuvert, x, y, gLastOuvert, x, y) < 0)
+                            for (int k = 0; k < imagesMat.Count; k++) gNewOuvert[k][x, y] = gLastOuvert[k][x, y];
                         int locOuv = 0, locFerm = 0;
                         for (int k = 0; k < imagesMat.Count; k++)
                         {
@@ -368,6 +560,8 @@ namespace EMP_AHP_UniquePreferenceFunction
             if (tauxFerm >= prStabilite) stopErod = true;
         }
 
+        // [V4-ANTI-CONDORCET] Ancienne comparaison (versions précédentes), conservée pour mémoire : la reconstruction
+        // ne l'appelle plus, elle utilise CompareReference (ordre de référence fixe et transitif).
         private int CompareDeuxVecteursAHP(List<int[,]> imgA, int xa, int ya, List<int[,]> imgB, int xb, int yb, double[] poids)
         {
             int m = imgA.Count;
@@ -398,6 +592,9 @@ namespace EMP_AHP_UniquePreferenceFunction
             return 0;
         }
 
+        // Ouverture = dilatation de l'érodé ; fermeture = érosion du dilaté (V3) : même ES
+        //   (disque euclidien de rayon 'rayon'), appliqué en une seule passe à chaque opération.
+        //   Pixel de bord (disque débordant de l'image) : valeur de l'image d'entrée conservée.
         private void OuvertureFermetureStandard(List<int[,]> imagesErodeInit, List<int[,]> imagesDilateInit, double[] poids, ref List<int[,]> imagesOuvertesStandards, ref List<int[,]> imagesFermeesStandards, int rayon)
         {
             List<int[,]> imagesErodPrec = new List<int[,]>();
@@ -409,40 +606,39 @@ namespace EMP_AHP_UniquePreferenceFunction
                 imagesErodPrec.Add((int[,])imagesDilateInit[k].Clone());
                 imagesDilatePrec.Add((int[,])imagesErodeInit[k].Clone());
             }
-            var offsB1 = GetDiskOffsets(1);
+            // V3 : ES = disque euclidien de rayon 'rayon' (pixels tels que dx² + dy² <= rayon²),
+            // utilisé directement en une seule passe : tous les pixels du disque sont comparés ensemble.
+            var offsBi = GetDiskOffsets(rayon);
             int W = imagesErodeInit[0].GetLength(0), H = imagesErodeInit[0].GetLength(1);
-            for (int elemStruct = 0; elemStruct < rayon; elemStruct++)
-            {
-                for (int x = 0; x < W; x++)
-                    for (int y = 0; y < H; y++)
+            for (int x = 0; x < W; x++)
+                for (int y = 0; y < H; y++)
+                {
+                    // Pixel de bord (le disque de rayon 'rayon' déborde de l'image) : valeur d'entrée conservée
+                    if (IsBorder(x, y, W, H, offsBi))
                     {
-                        if (IsBorder(x, y, W, H, offsB1))
+                        for (int k = 0; k < imagesErodeInit.Count; k++)
                         {
-                            for (int k = 0; k < imagesErodeInit.Count; k++)
-                            {
-                                imagesOuvertesStandards[k][x, y] = imagesDilatePrec[k][x, y];
-                                imagesFermeesStandards[k][x, y] = imagesErodPrec[k][x, y];
-                            }
-                        }
-                        else
-                        {
-                            int sMax = 0, tMax = 0, sMin = 0, tMin = 0;
-                            MinMaxVecteurs(imagesErodPrec, imagesDilatePrec, poids, x, y, ref sMin, ref tMin, ref sMax, ref tMax, 1);
-                            for (int k = 0; k < imagesErodeInit.Count; k++)
-                            {
-                                imagesFermeesStandards[k][x, y] = imagesErodPrec[k][sMin, tMin];
-                                imagesOuvertesStandards[k][x, y] = imagesDilatePrec[k][sMax, tMax];
-                            }
+                            imagesOuvertesStandards[k][x, y] = imagesDilatePrec[k][x, y];
+                            imagesFermeesStandards[k][x, y] = imagesErodPrec[k][x, y];
                         }
                     }
-                for (int k = 0; k < imagesErodeInit.Count; k++)
-                {
-                    imagesErodPrec[k] = (int[,])imagesFermeesStandards[k].Clone();
-                    imagesDilatePrec[k] = (int[,])imagesOuvertesStandards[k].Clone();
+                    else
+                    {
+                        int sMax = 0, tMax = 0, sMin = 0, tMin = 0;
+                        MinMaxVecteurs(imagesErodPrec, imagesDilatePrec, poids, x, y, ref sMin, ref tMin, ref sMax, ref tMax, rayon);
+                        for (int k = 0; k < imagesErodeInit.Count; k++)
+                        {
+                            imagesFermeesStandards[k][x, y] = imagesErodPrec[k][sMin, tMin];
+                            imagesOuvertesStandards[k][x, y] = imagesDilatePrec[k][sMax, tMax];
+                        }
+                    }
                 }
-            }
         }
 
+        // Érosion (infimum) et dilatation (supremum) multivaluées de taille 'rayon' (V3) :
+        //   ES = disque euclidien de rayon 'rayon' ; pour chaque pixel, l'infimum et le supremum sont
+        //   cherchés en UNE SEULE PASSE parmi TOUS les pixels-vecteurs couverts par ce disque.
+        //   Pixel de bord (disque débordant de l'image) : valeur de l'image d'entrée conservée.
         private void ErosionDilatationInit(List<int[,]> imagesMat, double[] poids, ref List<int[,]> imagesErodeInit, ref List<int[,]> imagesDilateInit, int rayon)
         {
             List<int[,]> imagesErodPrec = new List<int[,]>();
@@ -454,38 +650,33 @@ namespace EMP_AHP_UniquePreferenceFunction
                 imagesErodPrec.Add((int[,])imagesMat[k].Clone());
                 imagesDilatePrec.Add((int[,])imagesMat[k].Clone());
             }
-            var offsB1 = GetDiskOffsets(1);
+            // V3 : ES = disque euclidien de rayon 'rayon' (pixels tels que dx² + dy² <= rayon²),
+            // utilisé directement en une seule passe : tous les pixels du disque sont comparés ensemble.
+            var offsBi = GetDiskOffsets(rayon);
             int W = imagesMat[0].GetLength(0), H = imagesMat[0].GetLength(1);
-            for (int elemStruct = 0; elemStruct < rayon; elemStruct++)
-            {
-                for (int x = 0; x < W; x++)
-                    for (int y = 0; y < H; y++)
+            for (int x = 0; x < W; x++)
+                for (int y = 0; y < H; y++)
+                {
+                    // Pixel de bord (le disque de rayon 'rayon' déborde de l'image) : valeur d'entrée conservée
+                    if (IsBorder(x, y, W, H, offsBi))
                     {
-                        if (IsBorder(x, y, W, H, offsB1))
+                        for (int k = 0; k < imagesMat.Count; k++)
                         {
-                            for (int k = 0; k < imagesMat.Count; k++)
-                            {
-                                imagesDilateInit[k][x, y] = imagesDilatePrec[k][x, y];
-                                imagesErodeInit[k][x, y] = imagesErodPrec[k][x, y];
-                            }
-                        }
-                        else
-                        {
-                            int sMax = 0, tMax = 0, sMin = 0, tMin = 0;
-                            MinMaxVecteurs(imagesErodPrec, imagesDilatePrec, poids, x, y, ref sMin, ref tMin, ref sMax, ref tMax, 1);
-                            for (int k = 0; k < imagesMat.Count; k++)
-                            {
-                                imagesErodeInit[k][x, y] = imagesErodPrec[k][sMin, tMin];
-                                imagesDilateInit[k][x, y] = imagesDilatePrec[k][sMax, tMax];
-                            }
+                            imagesDilateInit[k][x, y] = imagesDilatePrec[k][x, y];
+                            imagesErodeInit[k][x, y] = imagesErodPrec[k][x, y];
                         }
                     }
-                for (int k = 0; k < imagesMat.Count; k++)
-                {
-                    imagesErodPrec[k] = (int[,])imagesErodeInit[k].Clone();
-                    imagesDilatePrec[k] = (int[,])imagesDilateInit[k].Clone();
+                    else
+                    {
+                        int sMax = 0, tMax = 0, sMin = 0, tMin = 0;
+                        MinMaxVecteurs(imagesErodPrec, imagesDilatePrec, poids, x, y, ref sMin, ref tMin, ref sMax, ref tMax, rayon);
+                        for (int k = 0; k < imagesMat.Count; k++)
+                        {
+                            imagesErodeInit[k][x, y] = imagesErodPrec[k][sMin, tMin];
+                            imagesDilateInit[k][x, y] = imagesDilatePrec[k][sMax, tMax];
+                        }
+                    }
                 }
-            }
         }
 
         private void MinMaxVecteurs(List<int[,]> imagesErodPrec, List<int[,]> imagesDilatePrec, double[] poids, int x, int y, ref int sMin, ref int tMin, ref int sMax, ref int tMax, int rayonDisque)
