@@ -7,6 +7,8 @@
 //   fixe et transitif (score de la méthode contre un panel fixe de vecteurs de l'image), et la suite
 //   des marqueurs est rendue monotone : plus de cycle de Condorcet, stabilité toujours atteinte.
 //   Le classement des n pixels de la fenêtre (MinMaxVecteurs) est inchangé.
+// Version V5 : [V5] ensemble de référence de l'ordre anti-Condorcet = TOUS les pixels de l'image, calcul exact bande par bande
+//   à partir des histogrammes (la V4 utilisait un échantillon de 256 pixels).
 using Microsoft.Win32;
 using System;
 using System.Collections.Generic;
@@ -305,63 +307,36 @@ namespace EMP_AHP_UniquePreferenceFunction
         // [V4-ANTI-CONDORCET] ORDRE DE RÉFÉRENCE FIXE POUR LE ∧ / ∨ POINT À POINT DE LA RECONSTRUCTION
         // =====================================================================================
         // Méthode : AHP.
-        // Problème corrigé : jusqu'ici, le ∧ / ∨ point à point de la reconstruction comparait deux vecteurs
-        // seuls (la méthode appliquée à l'ensemble {A, B}). Cette comparaison n'est pas transitive : elle
-        // admet des cycles de Condorcet (A > B, B > C et C > A), et la reconstruction pouvait tourner en
-        // boucle sans jamais se stabiliser.
-        // Correction : chaque vecteur v reçoit un score FIXE, calculé avec la même méthode et les mêmes
-        // paramètres, mais toujours contre le même panel de référence R : au plus TAILLE_PANEL_REF
-        // vecteurs prélevés une fois pour toutes dans l'image d'entrée f.
+        // Problème corrigé (V4) : le ∧ / ∨ point à point de la reconstruction comparait deux vecteurs seuls
+        // (la méthode appliquée à l'ensemble {A, B}). Cette comparaison n'est pas transitive : elle admet des
+        // cycles de Condorcet (A > B, B > C et C > A), et la reconstruction pouvait tourner en boucle sans
+        // jamais se stabiliser.
+        // Correction (V4) : chaque vecteur v reçoit un score FIXE, calculé avec la même méthode et les mêmes
+        // paramètres, mais toujours contre le même ensemble de référence R.
+        // [V5] R = TOUS les pixels de l'image d'entrée f (la V4 utilisait un échantillon de 256 pixels). Le score
+        // se décompose bande par bande : il est calculé EXACTEMENT à partir de l'histogramme de chaque bande de
+        // f (valeurs distinctes et nombre de pixels de chaque valeur), sans échantillonnage.
         //   S_R(v) = priorité globale AHP de v dans l'ensemble R ∪ {v} (mêmes matrices de préférence
-        //   1 + d / 1/(1 + |d|), même normalisation par colonne, mêmes poids que MinMaxVecteurs).
+        //   1 + d / 1/(1 + |d|), même normalisation par colonne, mêmes poids que MinMaxVecteurs)
+        //          = somme_k w_k alpha_k(v_k) : la priorité dans la bande k ne dépend que de la valeur v_k.
         // Deux vecteurs sont comparés par ce score, puis par l'ordre lexicographique des bandes en cas
         // d'égalité : c'est un ordre TOTAL sur les valeurs (réflexif, antisymétrique, transitif), donc
         // aucun cycle de Condorcet n'est possible. Le classement des n pixels de la fenêtre
         // (MinMaxVecteurs) n'est PAS modifié : seul le ∧ / ∨ point à point de la reconstruction change.
-        private const int TAILLE_PANEL_REF = 256;          // [V4-ANTI-CONDORCET] nombre maximal de vecteurs du panel R
-        private List<int[]> panelRef;                       // [V4-ANTI-CONDORCET] panel de référence R
         private int[] prioriteRef;                          // [V4-ANTI-CONDORCET] ordre des bandes pour le départage
-        private Dictionary<int[], double> cacheScoreRef;    // [V4-ANTI-CONDORCET] score déjà calculé de chaque vecteur
         private double[] poidsRef;                          // [V4-ANTI-CONDORCET] poids des bandes
-        private double[][] colRef;                          // [V4-ANTI-CONDORCET] sommes par colonne des préférences du panel
-        // [V4-ANTI-CONDORCET] Égalité exacte de deux vecteurs (clé du cache des scores)
-        private sealed class ComparateurVecteurs : IEqualityComparer<int[]>
-        {
-            public bool Equals(int[] a, int[] b)
-            {
-                if (ReferenceEquals(a, b)) return true;
-                if (a == null || b == null || a.Length != b.Length) return false;
-                for (int i = 0; i < a.Length; i++)
-                    if (a[i] != b[i]) return false;
-                return true;
-            }
+        private int nbPixelsRef;                            // [V5] N = nombre de pixels de l'image f (ensemble R)
+        private int[][] valeursRef;                         // [V5] valeurs distinctes de chaque bande de f (triées)
+        private int[][] effectifsRef;                       // [V5] nombre de pixels de f ayant chacune de ces valeurs
+        private Dictionary<int, double>[] scoreBandeRef;    // [V5] score par bande G_k(a) déjà calculé, pour chaque bande k
+        private double[][] colValeursRef;                   // [V5] col_k(b) = somme_{pixels r de f} P_k(r, b), pour chaque valeur b
 
-            public int GetHashCode(int[] a)
-            {
-                unchecked
-                {
-                    int h = 17;
-                    for (int i = 0; i < a.Length; i++) h = h * 31 + a[i];
-                    return h;
-                }
-            }
-        }
-
-        // [V4-ANTI-CONDORCET] Construction du panel R (prélèvement systématique : un pixel sur 'pas', dans
-        // l'ordre de parcours x puis y de l'image d'entrée) et de l'ordre de départage des bandes.
+        // [V4-ANTI-CONDORCET] [V5] Préparation de l'ensemble de référence R = toute l'image f : histogramme de
+        // chaque bande et ordre de départage des bandes.
         private void PreparerOrdreReference(List<int[,]> imagesMat, double[] poids)
         {
             int m = imagesMat.Count;
-            int W = imagesMat[0].GetLength(0), H = imagesMat[0].GetLength(1);
-            int total = W * H;
-            int pas = Math.Max(1, (total + TAILLE_PANEL_REF - 1) / TAILLE_PANEL_REF);
-            panelRef = new List<int[]>();
-            for (int p = 0; p < total; p += pas)
-            {
-                int[] v = new int[m];
-                for (int k = 0; k < m; k++) v[k] = imagesMat[k][p / H, p % H];
-                panelRef.Add(v);
-            }
+            ConstruireHistogrammesRef(imagesMat);
             // Départage : bandes par poids décroissant (à poids égaux, la bande d'indice le plus petit d'abord)
             prioriteRef = new int[m];
             for (int k = 0; k < m; k++) prioriteRef[k] = k;
@@ -377,21 +352,56 @@ namespace EMP_AHP_UniquePreferenceFunction
                 prioriteRef[j + 1] = bande;
             }
             poidsRef = (double[])poids.Clone();
-            // Sommes par colonne des matrices de préférence AHP restreintes au panel :
-            // colRef[k][j] = somme_{l dans R} P_k(r_l, r_j)
-            int nR = panelRef.Count;
-            colRef = new double[m][];
+            // [V5] Sommes par colonne de la matrice de préférence AHP de toute l'image, pour chaque valeur distincte b :
+            // col_k(b) = somme_{pixels r de f} P_k(r_k, b) = somme_{valeurs b'} n_k(b') P_k(b', b)
+            colValeursRef = new double[m][];
             for (int k = 0; k < m; k++)
             {
-                colRef[k] = new double[nR];
-                for (int j = 0; j < nR; j++)
+                int[] val = valeursRef[k], eff = effectifsRef[k];
+                colValeursRef[k] = new double[val.Length];
+                for (int j = 0; j < val.Length; j++)
                 {
                     double somme = 0;
-                    for (int l = 0; l < nR; l++) somme += PreferenceAHP(panelRef[l][k], panelRef[j][k]);
-                    colRef[k][j] = somme;
+                    for (int l = 0; l < val.Length; l++) somme += eff[l] * PreferenceAHP(val[l], val[j]);
+                    colValeursRef[k][j] = somme;
                 }
             }
-            cacheScoreRef = new Dictionary<int[], double>(new ComparateurVecteurs());
+        }
+
+        // [V5] Histogramme de chaque bande de f : valeurs distinctes (triées) et nombre de pixels de chaque valeur.
+        // Toute somme sur les N pixels de f d'une quantité qui ne dépend que de la valeur du pixel dans la bande k
+        // se calcule exactement comme une somme sur ces valeurs distinctes, pondérée par leurs effectifs.
+        private void ConstruireHistogrammesRef(List<int[,]> imagesMat)
+        {
+            int m = imagesMat.Count;
+            int W = imagesMat[0].GetLength(0), H = imagesMat[0].GetLength(1);
+            nbPixelsRef = W * H;
+            valeursRef = new int[m][];
+            effectifsRef = new int[m][];
+            scoreBandeRef = new Dictionary<int, double>[m];
+            for (int k = 0; k < m; k++)
+            {
+                Dictionary<int, int> histo = new Dictionary<int, int>();
+                for (int x = 0; x < W; x++)
+                    for (int y = 0; y < H; y++)
+                    {
+                        int g = imagesMat[k][x, y];
+                        int c;
+                        histo.TryGetValue(g, out c);
+                        histo[g] = c + 1;
+                    }
+                valeursRef[k] = new int[histo.Count];
+                effectifsRef[k] = new int[histo.Count];
+                int i = 0;
+                foreach (KeyValuePair<int, int> e in histo)
+                {
+                    valeursRef[k][i] = e.Key;
+                    effectifsRef[k][i] = e.Value;
+                    i++;
+                }
+                Array.Sort(valeursRef[k], effectifsRef[k]);
+                scoreBandeRef[k] = new Dictionary<int, double>();
+            }
         }
 
         // [V4-ANTI-CONDORCET] Préférence AHP de la valeur gi sur la valeur gj (même formule que MinMaxVecteurs)
@@ -401,36 +411,42 @@ namespace EMP_AHP_UniquePreferenceFunction
             return diff >= 0 ? 1 + diff : 1.0 / (1 - diff);
         }
 
-        // [V4-ANTI-CONDORCET] Score fixe S_R(v) : priorité globale AHP de v dans l'ensemble R ∪ {v}
-        private double ScoreReference(int[] v)
+        // [V5] alpha_k(a) = priorité AHP, dans la bande k, d'une valeur a ajoutée à toute l'image (ensemble R ∪ {v}),
+        // calculée exactement à partir de l'histogramme de la bande k
+        private double ScoreBande(int k, int a)
         {
             double s;
-            if (cacheScoreRef.TryGetValue(v, out s)) return s;
-            int m = v.Length;
-            int nR = panelRef.Count;
-            double total = 0;
-            for (int k = 0; k < m; k++)
+            if (scoreBandeRef[k].TryGetValue(a, out s)) return s;
+            int[] val = valeursRef[k], eff = effectifsRef[k];
+            double ligne = 0;        // somme de la ligne de v dans la matrice normalisée par colonne
+            double colonneV = 1.0;   // somme de la colonne de v : P(v, v) = 1 + somme_r P(r, v)
+            for (int j = 0; j < val.Length; j++)
             {
-                double ligne = 0;        // somme de la ligne de v dans la matrice normalisée par colonne
-                double colonneV = 1.0;   // somme de la colonne de v : P(v, v) = 1 + somme_j P(r_j, v)
-                for (int j = 0; j < nR; j++)
-                {
-                    double pvj = PreferenceAHP(v[k], panelRef[j][k]);
-                    ligne += pvj / (colRef[k][j] + pvj);                // colonne j = panel + ligne de v
-                    colonneV += PreferenceAHP(panelRef[j][k], v[k]);
-                }
-                ligne += 1.0 / colonneV;                                  // terme P(v, v) / somme de la colonne de v
-                total += poidsRef[k] * ligne / (nR + 1);                  // w_k * alpha_v^(k)
+                double pvj = PreferenceAHP(a, val[j]);
+                ligne += eff[j] * pvj / (colValeursRef[k][j] + pvj);   // colonnes des n_k(b) pixels de valeur b (+ ligne de v)
+                colonneV += eff[j] * PreferenceAHP(val[j], a);
             }
-            s = total;
-            if (double.IsNaN(s) || double.IsInfinity(s)) s = 0;   // sécurité : le score reste une fonction de v
-            s = Math.Round(s, 10);                                 // arrondi fixe : ex aequo numériques => départage lexicographique
-            cacheScoreRef[v] = s;
+            ligne += 1.0 / colonneV;                                    // terme P(v, v) / somme de la colonne de v
+            s = ligne / (nbPixelsRef + 1);                              // alpha_k(v_k) dans R ∪ {v}
+            scoreBandeRef[k][a] = s;
             return s;
         }
 
+        // [V4-ANTI-CONDORCET] [V5] Score fixe de v contre TOUS les pixels de l'image : priorité globale AHP de v dans
+        // R ∪ {v}, somme_k w_k alpha_k(v_k), multipliée par la constante N + 1. Ce facteur positif ne change pas
+        // l'ordre ; il ramène le score à l'échelle 1 pour que l'arrondi à 1e-10 reste négligeable même lorsque
+        // l'image compte des centaines de milliers de pixels.
+        private double ScoreReference(int[] v)
+        {
+            double s = 0;
+            for (int k = 0; k < v.Length; k++) s += poidsRef[k] * ScoreBande(k, v[k]);
+            s *= nbPixelsRef + 1.0;
+            if (double.IsNaN(s) || double.IsInfinity(s)) s = 0;   // sécurité : le score reste une fonction de v
+            return Math.Round(s, 10);                              // arrondi fixe : ex aequo numériques => départage lexicographique
+        }
+
         // [V4-ANTI-CONDORCET] Comparaison de deux vecteurs pour le ∧ / ∨ point à point de la reconstruction :
-        // score fixe (contre le panel R), puis ordre lexicographique des bandes (prioriteRef) en cas d'égalité.
+        // score fixe (contre l'ensemble de référence R), puis ordre lexicographique des bandes (prioriteRef) en cas d'égalité.
         // C'est un ordre total sur les valeurs : il est transitif, aucun cycle de Condorcet n'est possible.
         // Retourne -1 si A < B, 0 si A et B sont le même vecteur, 1 si A > B.
         private int CompareReference(List<int[,]> imgA, int xa, int ya, List<int[,]> imgB, int xb, int yb)
